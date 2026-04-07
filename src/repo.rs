@@ -243,3 +243,46 @@ pub async fn update_order_status(pool: &DbPool, id: Uuid, status: &str) -> Resul
         .await?;
     Ok(())
 }
+
+pub async fn insert_price_snapshot(
+    pool: &DbPool,
+    base: &str,
+    quote: &str,
+    price: rust_decimal::Decimal,
+    fetched_at: chrono::DateTime<chrono::Utc>,
+    source: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO prices (base, quote, price, fetched_at, source, created_at) VALUES ($1,$2,$3,$4,$5, now())")
+        .bind(base)
+        .bind(quote)
+        .bind(price)
+        .bind(fetched_at)
+        .bind(source)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn fetch_price_history_recent(
+    pool: &DbPool,
+    base: &str,
+    quote: &str,
+    limit: i64,
+) -> Result<Vec<(chrono::DateTime<chrono::Utc>, Decimal)>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT fetched_at, price FROM (
+            SELECT fetched_at, price FROM prices WHERE base = $1 AND quote = $2 ORDER BY fetched_at DESC LIMIT $3
+        ) sub ORDER BY fetched_at ASC"#,
+    )
+    .bind(base)
+    .bind(quote)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push((r.try_get("fetched_at")?, r.try_get("price")?));
+    }
+    Ok(out)
+}

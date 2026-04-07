@@ -186,9 +186,9 @@ input:focus, select:focus {
   padding: 2rem;
   display: grid;
   grid-template-columns: 300px 1fr 340px;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto;
   gap: 1.5rem;
-  height: 100vh;
+  min-height: 100vh;
 }
 
 .header {
@@ -236,7 +236,7 @@ input:focus, select:focus {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
-  overflow: hidden;
+  min-width: 0;
 }
 
 .right-sidebar {

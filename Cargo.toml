@@ -3,6 +3,11 @@ name = "engine"
 version = "0.1.0"
 edition = "2024"
 
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
 [dependencies]
 rust_decimal = { version = "1.37", features = ["serde-with-str"] }
 rust_decimal_macros = "1.37"
@@ -16,3 +21,7 @@ futures-util = "0.3"
 
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "chrono", "json", "migrate", "rust_decimal"] }
 dotenvy = "0.15"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+dashmap = "5.4"
+chrono = { version = "0.4", features = ["serde"] }
+ethers = { version = "1.0.0", features = ["abigen", "rustls"] }

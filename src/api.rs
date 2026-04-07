@@ -1,5 +1,5 @@
 use axum::{
-    extract::{State, Path, ws::{WebSocketUpgrade, WebSocket, Message as WsMsg}},
+    extract::{Path, Query, State, ws::{WebSocketUpgrade, WebSocket, Message as WsMsg}},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post, delete},
@@ -7,10 +7,14 @@ use axum::{
 };
 use futures_util::{StreamExt, SinkExt};
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
+use serde_json::Value as JsonValue;
+use crate::price_feed::PriceCache;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use rust_decimal::Decimal;
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
 use crate::matching_engine::engine::{Exchange, TradingPair};
 use crate::matching_engine::orderbook::{Order, BidOrAsk, TimeInForce};
@@ -24,6 +28,7 @@ pub enum WsMessage {
     Trade(TradeModel),
     OrderPlaced(Order),
     OrderCancelled { order_id: Uuid },
+    // Price updates are broadcast over a separate channel as JSON values.
 }
 
 #[derive(Clone)]
@@ -31,6 +36,8 @@ pub struct AppState {
     pub exchange: Arc<Mutex<Exchange>>,
     pub db: DbPool,
     pub tx: broadcast::Sender<WsMessage>,
+    pub price_cache: Arc<PriceCache>,
+    pub price_tx: broadcast::Sender<JsonValue>,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +72,55 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/orders/:order_id", delete(cancel_order))
         .route("/api/v1/market/:base/:quote/orderbook", get(get_orderbook))
         .route("/api/v1/ws", get(ws_handler))
+        .route("/api/v1/price/:base/:quote/history", get(get_price_history))
+        .route("/api/v1/price/:base/:quote", get(get_price))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+pub struct PriceHistoryParams {
+    #[serde(default = "price_history_default_limit")]
+    pub limit: i64,
+}
+
+fn price_history_default_limit() -> i64 {
+    200
+}
+
+#[derive(Serialize)]
+pub struct PriceHistoryPoint {
+    pub fetched_at: DateTime<Utc>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+}
+
+async fn get_price_history(
+    State(state): State<AppState>,
+    Path((base, quote)): Path<(String, String)>,
+    Query(params): Query<PriceHistoryParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.clamp(10, 2_000);
+    match repo::fetch_price_history_recent(&state.db, &base, &quote, limit).await {
+        Ok(rows) => {
+            let points: Vec<PriceHistoryPoint> = rows
+                .into_iter()
+                .map(|(fetched_at, price)| PriceHistoryPoint { fetched_at, price })
+                .collect();
+            (StatusCode::OK, Json(points)).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed to load price history").into_response(),
+    }
+}
+
+async fn get_price(
+    State(state): State<AppState>,
+    Path((base, quote)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Some(info) = crate::price_feed::get_price(&state.price_cache, &base, &quote) {
+        (StatusCode::OK, Json(info)).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Price not found").into_response()
+    }
 }
 
 async fn create_user(
@@ -277,12 +332,32 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, _) = socket.split();
     let mut rx = state.tx.subscribe();
+    let mut price_rx = state.price_tx.subscribe();
 
     tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if sender.send(WsMsg::Text(json)).await.is_err() {
-                    break;
+        loop {
+            tokio::select! {
+                m = rx.recv() => {
+                    match m {
+                        Ok(msg) => {
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(WsMsg::Text(json)).await.is_err() { break; }
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+                p = price_rx.recv() => {
+                    match p {
+                        Ok(val) => {
+                            if let Ok(json) = serde_json::to_string(&val) {
+                                if sender.send(WsMsg::Text(json)).await.is_err() { break; }
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => break,
+                    }
                 }
             }
         }

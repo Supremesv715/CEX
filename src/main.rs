@@ -4,6 +4,7 @@ pub mod matching_engine;
 pub mod api;
 pub mod db;
 pub mod repo;
+pub mod price_feed;
 
 use matching_engine::engine::{TradingPair, Exchange};
 use db::init_db;
@@ -16,6 +17,9 @@ use uuid::Uuid;
 use crate::repo::{load_users, load_balances, load_open_orders};
 use matching_engine::orderbook::{Order, BidOrAsk};
 use rust_decimal::Decimal;
+use std::sync::Arc as StdArc;
+use crate::price_feed::{PriceCache, start_coingecko_poller, start_chainlink_poller};
+use serde_json::Value as JsonValue;
 
 #[tokio::main]
 async fn main() {
@@ -114,9 +118,33 @@ async fn main() {
 
     let state = Arc::new(Mutex::new(exchange));
 
-    let (tx, _rx) = tokio::sync::broadcast::channel(100);
+    let (tx, _rx) = tokio::sync::broadcast::channel(1024);
 
-    let app_state = api::AppState { exchange: state.clone(), db: pool.clone(), tx };
+    let price_cache: StdArc<PriceCache> = StdArc::new(PriceCache::new());
+    let (price_tx, _price_rx) = tokio::sync::broadcast::channel::<JsonValue>(1024);
+
+    
+    start_coingecko_poller(price_cache.clone(), price_tx.clone(), 15, Some(pool.clone())).await;
+
+    
+    if let Ok(rpc) = std::env::var("CHAINLINK_RPC") {
+        if let Ok(feeds_str) = std::env::var("CHAINLINK_FEEDS") {
+            
+            let mut feeds = Vec::new();
+            for entry in feeds_str.split(',') {
+                if let Some((k, v)) = entry.split_once(':') {
+                    feeds.push((k.to_string(), v.to_string()));
+                }
+            }
+            if !feeds.is_empty() {
+                let feeds_len = feeds.len();
+                start_chainlink_poller(price_cache.clone(), price_tx.clone(), rpc, feeds.clone(), 15, Some(pool.clone())).await;
+                println!("Chainlink poller started with {} feeds", feeds_len);
+            }
+        }
+    }
+
+    let app_state = api::AppState { exchange: state.clone(), db: pool.clone(), tx, price_cache, price_tx };
 
     let app = api::router(app_state);
 
